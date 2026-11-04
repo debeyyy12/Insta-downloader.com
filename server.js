@@ -2,24 +2,28 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
+import { randomUUID } from 'node:crypto';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
 const CACHE_MS = 10 * 60 * 1000;
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_MAX = 20;
+const UPSTREAM = 'https://ig-dl-api.vercel.app/api';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36';
 
 const IG_HOSTS = new Set(['instagram.com', 'www.instagram.com', 'instagr.am', 'www.instagr.am']);
 const CDN_RE = /(^|\.)(cdninstagram\.com|fbcdn\.net)$/i;
+const PRIVATE_HOST_RE = /^(localhost|.*\.local|.*\.internal)$|^(\d{1,3}\.){3}\d{1,3}$|^\[?[0-9a-f:]+\]?$/i;
 
-const cache = new Map();
+const extractCache = new Map();
+const srcStore = new Map();
 const hits = new Map();
 
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '4kb' }));
-app.use((req, res, next) => {
+app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
   next();
@@ -32,6 +36,13 @@ const isCdn = src => {
   try {
     const u = new URL(src);
     return u.protocol === 'https:' && CDN_RE.test(u.hostname);
+  } catch { return false; }
+};
+
+const isSafeHttps = src => {
+  try {
+    const u = new URL(src);
+    return u.protocol === 'https:' && !PRIVATE_HOST_RE.test(u.hostname);
   } catch { return false; }
 };
 
@@ -49,7 +60,29 @@ function rateOk(ip) {
   const recent = (hits.get(ip) || []).filter(t => now - t < RATE_WINDOW_MS);
   recent.push(now);
   hits.set(ip, recent);
+  if (hits.size > 5000) hits.delete(hits.keys().next().value);
   return recent.length <= RATE_MAX;
+}
+
+function tokenFor(src) {
+  const t = randomUUID().replace(/-/g, '');
+  srcStore.set(t, { src, at: Date.now() });
+  if (srcStore.size > 2000) srcStore.delete(srcStore.keys().next().value);
+  return t;
+}
+
+const previewUrl = src => `/api/media?t=${tokenFor(src)}`;
+
+function mediaItem(m, shortcode, i) {
+  const filename = `ig-${shortcode}-${i + 1}.${m.type === 'video' ? 'mp4' : 'jpg'}`;
+  const preview = previewUrl(m.src);
+  return {
+    type: m.type,
+    src: m.src,
+    preview,
+    download: `${preview}&dl=1&name=${encodeURIComponent(filename)}`,
+    filename,
+  };
 }
 
 const decodeEntities = s => s
@@ -82,26 +115,70 @@ async function fetchText(url, ms = 12000) {
   }
 }
 
-const previewUrl = src => `/api/media?src=${encodeURIComponent(src)}`;
-
-function mediaItem(m, shortcode, i) {
-  const filename = `ig-${shortcode}-${i + 1}.${m.type === 'video' ? 'mp4' : 'jpg'}`;
-  const preview = previewUrl(m.src);
+function buildResponse(list, shortcode, meta) {
   return {
-    type: m.type,
-    src: m.src,
-    preview,
-    download: `${preview}&dl=1&name=${encodeURIComponent(filename)}`,
-    filename,
+    success: true,
+    type: list.length > 1 ? 'carousel' : list[0].type,
+    media: list.map((m, i) => mediaItem(m, shortcode, i)),
+    meta: {
+      username: meta.username || '',
+      description: String(meta.description || '').slice(0, 600),
+      thumbnail_url: meta.thumb ? previewUrl(meta.thumb) : '',
+      likes: meta.likes ?? null,
+    },
   };
 }
 
-/* ---------- scraping ---------- */
+/* ---------- extraction: upstream (primary) ---------- */
 
-async function extractPost({ kind, shortcode }) {
-  const hit = cache.get(shortcode);
-  if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
+// Upstream ke response ke alag-alag shapes handle karta hai.
+function pickList(d) {
+  const candidates = [d.media, d.data, d.data?.media, d.result, d.result?.media, d.items];
+  const arr = candidates.find(Array.isArray);
+  if (arr) return arr;
+  // Single URL wala response
+  const single = d.cdn_url || d.download_url || d.video_url || d.url || d.data?.url;
+  if (typeof single === 'string') return [{ url: single, type: /\.(mp4|mov|webm)(\?|$)/i.test(single) ? 'video' : 'image' }];
+  return [];
+}
 
+async function extractViaUpstream(igUrl) {
+  const r = await fetch(`${UPSTREAM}?url=${encodeURIComponent(igUrl)}`, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(18000),
+  });
+  if (!r.ok) throw Object.assign(new Error(`Upstream ${r.status}`), { status: 502 });
+
+  const text = await r.text();
+  let d;
+  try { d = JSON.parse(text); } catch {
+    throw Object.assign(new Error('Upstream returned non-JSON'), { status: 502 });
+  }
+  if (d.success === false) throw Object.assign(new Error(d.error || 'Upstream failed'), { status: 502 });
+
+  const list = pickList(d)
+    .map(x => {
+      const src = x.cdn_url || x.download_url || x.video_url || x.display_url || x.url || x.src || '';
+      const isVid = /video/i.test(x.type || '') || !!x.video_url || /\.(mp4|mov|webm)(\?|$)/i.test(src);
+      return { type: isVid ? 'video' : 'image', src };
+    })
+    .filter(x => isSafeHttps(x.src));
+
+  if (!list.length) throw Object.assign(new Error('No public media found.'), { status: 404 });
+
+  const meta = d.meta || d.metadata || d.data?.meta || {};
+  const thumb = meta.thumbnail_url && isSafeHttps(meta.thumbnail_url) ? meta.thumbnail_url : '';
+  return buildResponse(list, 'upstream', {
+    username: meta.username || '',
+    description: meta.description || meta.caption || '',
+    thumb,
+    likes: meta.likes ?? null,
+  });
+}
+
+/* ---------- extraction: scraper (fallback) ---------- */
+
+async function extractViaScraper({ kind, shortcode }) {
   const canonical = `https://www.instagram.com/${kind}/${shortcode}/`;
   const raw = { videos: [], images: [], username: '', caption: '' };
 
@@ -111,7 +188,7 @@ async function extractPost({ kind, shortcode }) {
     for (const m of embed.matchAll(/"display_url"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) raw.images.push(decodeJsonString(m[1]));
     const u = embed.match(/"username"\s*:\s*"([^"]+)"/);
     if (u) raw.username = u[1];
-  } catch { /* fall through to OG tags */ }
+  } catch { /* OG tags par fallback */ }
 
   try {
     const page = await fetchText(canonical);
@@ -124,7 +201,7 @@ async function extractPost({ kind, shortcode }) {
       const m = ogTag(page, 'og:title').match(/@([\w.]+)/);
       if (m) raw.username = m[1];
     }
-  } catch { /* nothing more to try */ }
+  } catch { /* aur kuch nahi */ }
 
   const videos = [...new Set(raw.videos)].filter(isCdn);
   const images = [...new Set(raw.images)].filter(isCdn);
@@ -133,25 +210,41 @@ async function extractPost({ kind, shortcode }) {
     : images.map(src => ({ type: 'image', src }));
 
   if (!list.length) {
-    const err = new Error('No public media found. The post may be private or unavailable.');
-    err.status = 404;
-    throw err;
+    throw Object.assign(new Error('No public media found. The post may be private or unavailable.'), { status: 404 });
   }
 
-  const data = {
-    success: true,
-    type: list.length > 1 ? 'carousel' : list[0].type,
-    media: list.map((m, i) => mediaItem(m, shortcode, i)),
-    meta: {
-      username: raw.username,
-      description: raw.caption.slice(0, 600),
-      thumbnail_url: images[0] ? previewUrl(images[0]) : '',
-      likes: null,
-    },
-  };
+  return buildResponse(list, shortcode, {
+    username: raw.username,
+    description: raw.caption,
+    thumb: images[0] || '',
+    likes: null,
+  });
+}
 
-  if (cache.size > 500) cache.delete(cache.keys().next().value);
-  cache.set(shortcode, { at: Date.now(), data });
+/* ---------- combined ---------- */
+
+async function extractAny(igUrl, parsed) {
+  const key = parsed.shortcode;
+  const hit = extractCache.get(key);
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
+
+  let data;
+  try {
+    data = await extractViaUpstream(igUrl);
+  } catch (upErr) {
+    console.warn('[upstream failed]', upErr.message);
+    try {
+      data = await extractViaScraper(parsed);
+    } catch (scErr) {
+      console.warn('[scraper failed]', scErr.message);
+      const err = new Error(scErr.message || upErr.message);
+      err.status = scErr.status || 502;
+      throw err;
+    }
+  }
+
+  if (extractCache.size > 500) extractCache.delete(extractCache.keys().next().value);
+  extractCache.set(key, { at: Date.now(), data });
   return data;
 }
 
@@ -163,17 +256,18 @@ app.post('/api/extract', async (req, res) => {
   if (!rateOk(req.ip)) {
     return res.status(429).json({ success: false, error: 'Too many requests. Slow down a bit.' });
   }
-  const parsed = parseIgUrl(req.body?.url);
+  const url = String(req.body?.url || '').trim();
+  const parsed = parseIgUrl(url);
   if (!parsed) {
     return res.status(400).json({ success: false, error: 'Enter a valid instagram.com post, reel, or tv URL.' });
   }
   try {
-    res.json(await extractPost(parsed));
+    res.json(await extractAny(url, parsed));
   } catch (e) {
     const status = e.status || 502;
     res.status(status).json({
       success: false,
-      error: status === 404 ? e.message : 'Could not reach Instagram right now. Try again shortly.',
+      error: status === 404 ? e.message : 'Could not extract media right now. Try again shortly.',
     });
   }
 });
@@ -183,32 +277,30 @@ app.post('/api/direct', (req, res) => {
     return res.status(429).json({ success: false, error: 'Too many requests. Slow down a bit.' });
   }
   const src = String(req.body?.url || '').trim();
-  if (!isCdn(src)) {
-    return res.status(400).json({ success: false, error: 'Only Instagram or Facebook CDN media URLs are allowed.' });
+  if (!isSafeHttps(src)) {
+    return res.status(400).json({ success: false, error: 'Only public https media URLs are allowed.' });
   }
   const type = /\.(mp4|mov|webm)(\?|$)/i.test(src) ? 'video' : 'image';
-  res.json({
-    success: true,
-    type,
-    media: [mediaItem({ type, src }, 'direct', 0)],
-    meta: {
-      username: 'Direct CDN URL',
-      description: 'Direct media URL',
-      thumbnail_url: type === 'image' ? previewUrl(src) : '',
-      likes: null,
-    },
-  });
+  res.json(buildResponse([{ type, src }], 'direct', {
+    username: 'Direct CDN URL',
+    description: 'Direct media URL',
+    thumb: type === 'image' ? src : '',
+    likes: null,
+  }));
 });
 
 app.get('/api/media', async (req, res) => {
-  const src = String(req.query.src || '');
-  if (!isCdn(src)) return res.status(400).json({ error: 'Host not allowed' });
+  const entry = srcStore.get(String(req.query.t || ''));
+  if (!entry || Date.now() - entry.at > CACHE_MS) {
+    return res.status(404).json({ error: 'Link expired. Extract again.' });
+  }
+  const src = entry.src;
 
   const headers = { 'User-Agent': UA, Referer: 'https://www.instagram.com/' };
   if (req.headers.range) headers.Range = req.headers.range;
 
   try {
-    const up = await fetch(src, { headers, redirect: 'follow' });
+    const up = await fetch(src, { headers, redirect: 'follow', signal: AbortSignal.timeout(30000) });
     if (!up.ok && up.status !== 206) return res.status(502).json({ error: `Upstream ${up.status}` });
 
     const ct = up.headers.get('content-type') || '';
