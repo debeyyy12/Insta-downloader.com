@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en" data-theme="glass">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f4f5f9">
+<title>Media Extractor Pro</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="sun" aria-hidden="true"></div>
+<div class="grid-floor" aria-hidden="true"></div>
+
+<main class="wrap">
+  <header class="topbar">
+    <div class="brand">
+      <div class="cube-stage" aria-hidden="true">
+        <div class="cube"><span></span><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+      <div>
+        <h1>Media Extractor</h1>
+        <p>Instagram post · reel · image → clean media</p>
+      </div>
+    </div>
+    <div class="themes" role="radiogroup" aria-label="Theme">
+      <button data-set-theme="glass" role="radio" aria-checked="true" title="Liquid Glass" style="--sw:linear-gradient(135deg,#9187ff,#43b4dc)"></button>
+      <button data-set-theme="neon" role="radio" aria-checked="false" title="Neon Cyber" style="--sw:linear-gradient(135deg,#ff2bd6,#00f0ff)"></button>
+      <button data-set-theme="aurora" role="radio" aria-checked="false" title="Aurora" style="--sw:linear-gradient(135deg,#2de2b0,#7c5cff)"></button>
+      <button data-set-theme="synthwave" role="radio" aria-checked="false" title="Synthwave" style="--sw:linear-gradient(135deg,#ff6ec7,#ffb86b)"></button>
+    </div>
+  </header>
+
+  <section class="glass panel tilt" data-tilt>
+    <div class="tabs" role="tablist" aria-label="URL type">
+      <button class="tab" data-mode="ig" role="tab" aria-selected="true">Instagram URL</button>
+      <button class="tab" data-mode="cdn" role="tab" aria-selected="false">Paste CDN URL</button>
+    </div>
+    <form id="form" autocomplete="off">
+      <div class="inputrow">
+        <input id="url" class="input" type="url" inputmode="url" autocapitalize="off" spellcheck="false"
+               placeholder="Paste Instagram post or reel URL" aria-label="URL" required>
+        <button id="go" class="primary" type="submit"><span>Extract</span><i></i></button>
+      </div>
+    </form>
+    <div class="hint" id="hint">Public posts, reels and TV links. Press Enter to extract.</div>
+    <div class="statusline"><span id="status" class="status hidden" aria-live="polite"></span></div>
+  </section>
+
+  <section id="results" class="results hidden" aria-live="polite"></section>
+
+  <footer class="footer">
+    <div class="footbuttons">
+      <button type="button" id="docsBtn">Docs</button>
+      <button type="button" id="promptBtn">Prompt</button>
+    </div>
+    <div>Copyright © Rolex 2026</div>
+    <div class="credit">Credit @RolexBot00</div>
+  </footer>
+</main>
+
+<div id="toast" class="toast" role="status"></div>
+
+<div id="modal" class="modalback hidden" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+  <div class="modal glass">
+    <div class="modalhead">
+      <h2 id="mTitle">Details</h2>
+      <button class="close" id="mClose" aria-label="Close">×</button>
+    </div>
+    <pre id="mBody" class="modalpre"></pre>
+    <div class="modalactions">
+      <button class="action" id="mCopy">Copy</button>
+      <button class="action" id="mDone">Done</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js" defer></script>
+</body>
+        </html>
